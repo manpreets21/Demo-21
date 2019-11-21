@@ -1,0 +1,170 @@
+- hosts: localhost
+  vars:
+    resource_group: CAMPPRGPOC1
+    vmss_name: myScaleSet
+    vmss_lb_name: myScaleSetLb
+    location: eastus
+    admin_username: sysadmin
+    admin_password: test@123456789
+    repo_url: https://github.com/spring-guides/gs-spring-boot.git
+    vnet_ip_address: "{{}}"
+    subnet_ip: ""
+    workspace: ~/src/helloworld
+  
+  tasks:
+    - name: Create a resource group
+      azure_rm_resourcegroup:
+        name: "{{ resource_group }}"
+        location: "{{ location }}"
+    - name: Create virtual network
+      azure_rm_virtualnetwork:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vmss_name }}"
+        address_prefixes: "{{vnet_ip_address}}}"
+    - name: Add subnet
+      azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vmss_name }}"
+        address_prefix: "{{}subnet_ip}"
+        virtual_network: "{{ vmss_name }}"
+    - name: Create public IP address
+      azure_rm_publicipaddress:
+        resource_group: "{{ resource_group }}"
+        allocation_method: Static
+        name: "{{ vmss_name }}"
+    - name: Create Network Security Group that allows SSH
+      azure_rm_securitygroup:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vmss_name }}"
+        rules:
+          - name: SSH
+            protocol: Tcp
+            destination_port_range: 22
+            access: Allow
+            priority: 1001
+            direction: Inbound
+
+    - name: Create a load balancer
+      azure_rm_loadbalancer:
+        name: "{{ vmss_lb_name }}"
+        location: "{{ location }}"
+        resource_group: "{{ resource_group }}"
+        public_ip: "{{ vmss_name }}"
+        probe_protocol: Tcp
+        probe_port: 8080
+        probe_interval: 10
+        probe_fail_count: 3
+        protocol: Tcp
+        load_distribution: Default
+        frontend_port: 80
+        backend_port: 8080
+        idle_timeout: 4
+        natpool_frontend_port_start: 50000
+        natpool_frontend_port_end: 50040
+        natpool_backend_port: 22
+        natpool_protocol: Tcp
+
+    - name: Create Scale Set
+      azure_rm_virtualmachinescaleset:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vmss_name }}"
+        vm_size: Standard_DS1_v2
+        admin_username: "{{ admin_username }}"
+        admin_password: "{{ admin_password }}"
+        ssh_password_enabled: true
+        capacity: 2
+        virtual_network_name: "{{ vmss_name }}"
+        subnet_name: "{{ vmss_name }}"
+        upgrade_policy: Manual
+        tier: Standard
+        managed_disk_type: Standard_LRS
+        os_disk_caching: ReadWrite
+        image:
+          offer: UbuntuServer
+          publisher: Canonical
+          sku: 16.04-LTS
+          version: latest
+        load_balancer: "{{ vmss_lb_name }}"
+        data_disks:
+          - lun: 0
+            disk_size_gb: 20
+            managed_disk_type: Standard_LRS
+            caching: ReadOnly
+          - lun: 1
+            disk_size_gb: 30
+            managed_disk_type: Standard_LRS
+            caching: ReadOnly
+
+    - name: Get facts for all Public IPs within a resource groups
+      azure_rm_publicipaddress_facts:
+        resource_group: "{{ resource_group }}"
+      register: output_ip_address
+
+    - name: Get loadbalancer info
+      azure_rm_loadbalancer_facts:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vmss_lb_name }}"
+      register: output
+
+    - name: Print output
+      debug:
+        msg: "{{ output }}"
+
+    - name: Print output_ip_address
+      debug:
+        msg: "{{ output_ip_address }}"
+
+    - name: Print ansible_host
+      debug:
+        msg: "{{ output_ip_address.ansible_facts.azure_publicipaddresses[0].properties.ipAddress }}"
+
+    - name: Add all hosts
+      add_host:
+        groups: scalesethosts
+        hostname: "{{ output_ip_address.ansible_facts.azure_publicipaddresses[0].properties.ipAddress }}_{{ item.properties.frontendPort }}"
+        ansible_host: "{{ output_ip_address.ansible_facts.azure_publicipaddresses[0].properties.ipAddress }}"
+        ansible_port: "{{ item.properties.frontendPort }}"
+        ansible_ssh_user: "{{ admin_username }}"
+        ansible_ssh_pass: "{{ admin_password }}"
+      with_items:
+        - "{{ output.ansible_facts.azure_loadbalancers[0].properties.inboundNatRules }}"
+
+    - name: Git Clone sample app
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ workspace }}"
+        
+    - name: Install maven
+      apt: name={{item}} state=present update_cache=no
+      with_items:
+        - maven
+
+    - name: Build sample app
+      shell: mvn package chdir="{{ workspace }}/complete"
+
+    - pause:
+        minutes: 5
+
+- hosts: scalesethosts
+  become: yes
+  vars:
+    workspace: ~/src/helloworld
+    admin_username: "{{admin_username}}"
+    admin_password: "{{admin_password}}"
+  tasks:
+    - name: Install JRE
+      yum:
+        name: default-jre
+        state: present 
+
+    - name: Copy app to Azure VM
+      copy:
+        src: "{{ workspace }}/complete/target/gs-spring-boot-0.1.0.jar"
+        dest: "/home/{{ admin_username }}/helloworld.jar"
+        force: yes
+        mode: 0755
+
+    - name: Start the application
+      shell: java -jar "/home/{{ admin_username }}/helloworld.jar" >/dev/null 2>&1 &
+      async: 5000
+      poll: 0

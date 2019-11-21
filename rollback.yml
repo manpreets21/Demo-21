@@ -1,0 +1,9 @@
+- hosts: localhost
+  vars:
+    resource_group: ""
+  tasks: 
+    - name: Create a resource group
+      azure_rm_resourcegroup:
+        name: "{{ resource_group }}"
+        location: "{{ location }}"
+		state: absent 
